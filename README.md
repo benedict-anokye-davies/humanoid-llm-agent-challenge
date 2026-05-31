@@ -1,111 +1,145 @@
 # LLM Agent in a Virtual World
 
-A minimal but complete system that places an LLM agent into a 2D grid world, where it perceives its surroundings, reasons about goals, and takes actions in a loop.
+> A partially observable maze-solving agent that builds a spatial memory, calls an A* planner as a tool, and navigates an 8×8 grid to find a key and unlock a door.
+
+Built for the **Humanoid Software Engineering Internship** challenge.
 
 ## Quick start
 
 ```bash
-# 1. Install dependencies
 pip install -r requirements.txt
-
-# 2. Set your OpenAI API key
 export OPENAI_API_KEY="sk-..."
-
-# 3. Run the agent
 python main.py
 ```
 
-The agent will navigate the grid, pick up the key, and open the door. Output is printed to the terminal and saved to `run_log.json`.
+The agent runs live in the terminal, printing its thoughts, actions, and its evolving mental map of the maze. A JSONL log is written to `demo_log.jsonl`.
 
-## System overview
+## System architecture
 
-| Component | File | Responsibility |
-|-----------|------|----------------|
-| **World** | `world.py` | 2D grid environment, state transitions, observation generator |
-| **Agent** | `agent.py` | LLM harness: observation → reasoning → JSON action |
-| **Runner** | `main.py` | Episode loop, logging, success/fail reporting |
-
-## The harness (what we care about)
-
-The core challenge is the **interface between the LLM and the environment** — not the world itself.
-
-### Observation format
-
-The agent receives structured JSON:
-
-```json
-{
-  "position": {"x": 0, "y": 0},
-  "facing": "E",
-  "ahead": "floor",
-  "inventory": {"key": false},
-  "door_open": false,
-  "steps_remaining": 25,
-  "message": "Moved E to (1, 0).",
-  "goal_reached": false
-}
+```
+┌─────────────┐     observation     ┌─────────────┐
+│   World     │ ──────────────────> │   Agent     │
+│  (fog,      │                     │  (LLM +      │
+│   walls)    │ <────────────────── │   memory +   │
+│             │      action         │   planner)  │
+└─────────────┘                     └─────────────┘
 ```
 
-**Why this representation?** It gives the LLM exactly what a human player would need: where am I, what is in front of me, what do I carry, and how much time is left. No raw pixel matrices, no hidden state.
+| Module | Responsibility |
+|--------|---------------|
+| `world.py` | Partially observable 8×8 grid; fog-of-war with occlusion |
+| `memory.py` | AgentSpatialMemory: explored cells, known walls, objects, frontier |
+| `planner.py` | A* pathfinder exposed as a `plan_route` tool callable by the LLM |
+| `agent.py` | Harness: OpenAI function-calling API, retry logic, tool execution |
+| `main.py` | Episode loop, coloured terminal render, JSONL logging |
+| `test_all.py` | pytest: world physics, memory updates, A*, agent parsing |
 
-### Action space
+## The challenge, solved
 
-The agent responds with JSON:
+### 1. Partial observability (fog of war)
+
+The agent only sees cells within a Manhattan-radius of 2, and only if a wall does not block the straight-line path. This mirrors real robotics: cameras and LiDAR have range limits and occlusion.
+
+**Design choice:** We use a simple ray-cast occlusion check rather than giving the LLM raw pixel matrices. The LLM reasons about discrete symbolic observations (`wall`, `key`, `door_locked`) rather than interpreting visual features. This is closer to how indoor robots build occupancy grids.
+
+### 2. Spatial memory
+
+The agent maintains an `AgentSpatialMemory` object across turns:
+
+- `explored`: every cell the agent has ever seen
+- `walls`: known obstacles (persists across turns)
+- `known_objects`: persistent map of key, door locations once observed
+- `frontier`: unexplored cells adjacent to explored ones (classical exploration target)
+
+This memory is serialized into a text summary and an ASCII grid map that the LLM reads every turn. The agent therefore **learns the map** rather than re-deriving it from scratch each observation.
+
+### 3. Tool use: A* planner
+
+Rather than emitting raw `move` commands for every step, the agent can call:
 
 ```json
-{
-  "thought": "The key is to my east; I should move forward.",
-  "action": "move",
-  "direction": "E"
-}
+<tool name="plan_route">{"target": {"x": 6, "y": 1}}</tool>
 ```
 
-Supported actions: `move`, `turn`, `look`, `pick_up`, `open_door`. This discrete, typed interface prevents the LLM from hallucinating invalid commands.
+The harness executes A* over the agent's **known** walls, returns the shortest path, and the agent converts the first step into a `move` action. This separates **strategic planning** (LLM decides the goal) from **tactical pathfinding** (classical search on a known map).
 
-### ReAct-style loop
+This design is inspired by **Voyager** (Wang et al., 2023): the LLM writes high-level skill code, while low-level motor control is handled by deterministic algorithms.
 
-Each turn follows:
+### 4. Resilient harness
 
-1. **Observe** — world emits structured state  
-2. **Reason** — LLM generates a brief thought  
-3. **Act** — LLM emits a valid JSON action  
+- **Function-calling API:** Structured tool calls reduce hallucination.
+- **Retry loop:** Bad JSON or API errors trigger up to 3 retries with a fallback to `look`.
+- **Markdown stripping:** The parser tolerates ` ```json ... ``` ` wrappers.
+- **Validation:** Unknown actions default to `look`; out-of-bounds directions are sanitised.
+
+### 5. ReAct-style reasoning loop
+
+Each turn follows the ReAct pattern (Yao et al., 2022):
+
+1. **Observe** — world emits partial observation + memory summary
+2. **Reason** — LLM generates a `thought` string
+3. **Act** — LLM emits a structured action or tool call
 4. **Transition** — world updates, new observation emitted
 
-The agent's conversation history is maintained across steps so the LLM retains context without re-deriving the map every turn.
+The conversation history is truncated to the last 6 turns to stay within context limits while retaining short-term memory.
 
-## World design
+## The maze
 
 ```
-# = wall   K = key   D = door   > = agent (facing East)
-
-0  . . K . .
-1  . # . # .
-2  . . D . .
-3  . # . . .
-4  . . . . .
+0 > . . # . . . .
+1 . . # # # # K .
+2 . . . . . # . .
+3 . # # # . # . .
+4 . . . . . . . .
+5 . # # # # # . .
+6 . . . . . . D .
+7 . . . . . . . .
 ```
 
-- Agent starts at (0,0) facing East.
-- Key is at (2,0).
-- Door is at (2,2), locked until the key is picked up.
-- Walls create simple obstacles requiring navigation.
+- `>` = agent (facing East)
+- `#` = wall
+- `K` = key
+- `D` = locked door
+- `.` = floor
 
-## Design choices & trade-offs
+The agent must explore corridors, discover the key behind a wall cluster, plan a route, pick up the key, then navigate to the door.
 
-1. **2D grid over 3D or text** — Keeps observation space small and deterministic. The LLM reasons about (x,y) coordinates rather than parsing raw pixels or ambiguous prose.
+## Design note: why this approach?
 
-2. **Discrete actions over free text** — Prevents the LLM from emitting invalid commands. The world layer validates every action before applying state changes.
+### Observation format: structured JSON, not pixels or prose
 
-3. **Structured JSON over natural language** — Removes parsing ambiguity. The harness extracts JSON from markdown code blocks if the LLM wraps its output, making the system robust to minor formatting variations.
+Robots do not feed raw camera frames into an LLM. They run SLAM, object detection, or semantic segmentation, then produce symbolic scene graphs. Our observation format (`position`, `facing`, `ahead`, `visible_cells`) is a minimal scene graph. It gives the LLM exactly the information a human player would need, without hallucination-inducing ambiguity.
 
-4. **Local state over learned world model** — The agent does not build an internal map; it relies on the world to tell it what is ahead. This is simpler and sufficient for small grids. Scaling up would add a spatial memory layer (e.g. an explored-cell set).
+### Action space: discrete, typed
+
+A free-text action space invites the LLM to invent invalid commands (`"jump over wall"`, `"ask for hint"`). By restricting actions to `{move, turn, look, pick_up, open_door}` with typed parameters, the world layer can validate every input. Invalid actions produce informative error messages that the LLM learns from on the next turn.
+
+### Tool use vs end-to-end control
+
+End-to-end LLM control (emitting `move N` 20 times in a row) works on small grids but fails on larger ones because:
+- The LLM loses count of steps
+- It hallucinates walls that do not exist
+- It cannot backtrack efficiently
+
+By giving the LLM a `plan_route` tool, we offload path arithmetic to A* and let the LLM focus on **goal selection** and **re-planning when the map changes**. This is the same division of labour used in autonomous driving (LLM for intent, MPC for trajectory).
+
+### Comparison to my own work
+
+This harness pattern is the same one I use in **Asterion**, my open-source async multi-tool agent system. Both systems:
+- Separate tool definitions from tool implementations
+- Maintain persistent state (memory) across turns
+- Validate and retry LLM outputs before executing side effects
+- Log structured traces for debugging
+
+The difference is scale: Asterion runs 10+ parallel tool calls over HTTP APIs with conversation trees; this challenge is a single-threaded grid-world proof of concept. The underlying architecture is identical.
 
 ## Optional extensions
 
-- Replace `gpt-4o-mini` with any OpenAI-compatible model (Claude via Anthropic SDK, local LLM via llama.cpp).
-- Add fog-of-war: agent only sees a 3×3 neighbourhood instead of the whole grid.
-- Add multiple goals, hazards, or a second agent for multi-agent coordination.
+- Replace `gpt-4o-mini` with any OpenAI-compatible endpoint (Claude via Anthropic SDK, local LLM via llama.cpp, or Fireworks kimi-k2p6).
+- Add a patrolling guard that the agent must avoid, turning the maze into a pursuit-evasion game.
+- Add multiple keys (colour-coded) and conditional doors, forcing the LLM to plan a fetch-quest sequence.
+- Replace fog-of-war with a probabilistic occupancy grid: the agent maintains P(wall) for unseen cells rather than binary known/unknown.
 
 ## Author
 
-Built for the Humanoid Software Engineering Internship challenge. The same agent-harness pattern powers my open-source project Asterion, an async multi-tool agent system.
+Built by Benedict Anokye-Davies for the Humanoid Software Engineering Internship challenge. The agent-harness pattern is adapted from my open-source project [Asterion](https://github.com/benedict-anokye-davies/asterion-agent).
