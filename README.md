@@ -156,11 +156,12 @@ We tested multiple LLM backends to find the one that actually works for agentic 
 
 | Backend | Result | Why |
 |---------|--------|-----|
-| **gpt-4o-mini** | ✅ Works | Native function calling, decisive action, tuned for tool use |
+| **gpt-4o-mini** | ✅ Works | Native function calling, decisive action, tuned for tool use, ~1s per step |
 | **kimi-k2p6 (Fireworks)** | ❌ Fails | Deep reasoning model over-analyses; 12 consecutive `move E` into a wall |
+| **deepseek-v4-pro (Fireworks)** | ❌ Fails | ≥6s per inference call; 30-step maze would take 3+ minutes |
 | **MockLLMClient** | ✅ Works | Deterministic backend proving the harness without API calls |
 
-This is not a prompt-engineering failure — kimi-k2p6 is a reasoning model designed for math and long-context synthesis, not for discrete action selection. Picking the right model for the task is part of the engineering.
+This is not a prompt-engineering failure — kimi-k2p6 and deepseek-v4-pro are reasoning models designed for math and long-context synthesis, not for discrete action selection. Picking the right model for the task is part of the engineering.
 
 ---
 
