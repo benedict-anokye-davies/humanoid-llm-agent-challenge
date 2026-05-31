@@ -14,6 +14,8 @@ python main.py
 
 The agent runs live in the terminal, printing its thoughts, actions, and its evolving mental map of the maze. A JSONL log is written to `demo_log.jsonl`.
 
+Or open the **interactive web demo** (`demo.html`) in any browser — no server required. Shows side-by-side real world + agent's mental map with play/pause/step controls.
+
 ## System architecture
 
 ```
