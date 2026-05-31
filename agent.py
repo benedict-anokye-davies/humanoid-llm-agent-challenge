@@ -50,21 +50,22 @@ RULES:
 4. You must be adjacent to the door to open it.
 5. If a planned path is blocked by an unknown wall, backtrack and explore.
 
-ACTION FORMAT:
-Respond with a JSON object:
-{
-  "thought": "1-2 sentence reasoning",
-  "action": "move | turn | look | pick_up | open_door",
-  "direction": "N | E | S | W | left | right"  // for move or turn
-}
+RESPONSE FORMAT — STRICT:
+You MUST respond with ONLY a valid JSON object. No markdown fences, no explanations outside the JSON, no thinking steps.
 
-Or call a tool by wrapping it in <tool> tags:
-<tool name="plan_route">{"target": {"x": 6, "y": 1}}</tool>
+{"thought": "1-2 sentence reasoning", "action": "move | turn | look | pick_up | open_door", "direction": "N | E | S | W | left | right"}
+
+The "direction" field is required only for "move" and "turn" actions. For other actions, set it to null.
+
+If you want to plan a route, include:
+{"thought": "Planning route to key", "action": "plan_route", "direction": null, "target": {"x": 6, "y": 1}}
+
+NEVER output anything except the JSON object.
 """
 
 
 class LLMAgent:
-    def __init__(self, model: str = "gpt-4o-mini", api_key: Optional[str] = None):
+    def __init__(self, model: str = "gpt-4o-mini", api_key: Optional[str] = None, base_url: Optional[str] = None):
         self.model = model
         self.memory = AgentSpatialMemory()
         self.client = None
@@ -76,7 +77,10 @@ class LLMAgent:
         key = api_key or os.getenv("OPENAI_API_KEY")
         if not key:
             raise RuntimeError("Set OPENAI_API_KEY environment variable.")
-        self.client = OpenAI(api_key=key)
+        kwargs = {"api_key": key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        self.client = OpenAI(**kwargs)
 
     def act(self, observation: Dict) -> Dict:
         """Main entry: observe, reason, act or call tool."""
@@ -85,29 +89,48 @@ class LLMAgent:
         obs_text = json.dumps(observation, indent=2)
         mem_text = self.memory.get_memory_summary()
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            *self._build_history(),
-            {
-                "role": "user",
-                "content": f"CURRENT OBSERVATION:\n{obs_text}\n\nMEMORY:\n{mem_text}\n\nWhat is your next action or tool call?",
-            },
-        ]
+        # For non-OpenAI models, put system instructions in user message
+        # because many models (kimi, llama) deprioritise system prompts
+        is_openai = "gpt-4" in self.model or "gpt-3.5" in self.model
+
+        if is_openai:
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                *self._build_history(),
+                {
+                    "role": "user",
+                    "content": f"CURRENT OBSERVATION:\n{obs_text}\n\nMEMORY:\n{mem_text}\n\nWhat is your next action or tool call?",
+                },
+            ]
+        else:
+            messages = [
+                *self._build_history(),
+                {
+                    "role": "user",
+                    "content": f"{SYSTEM_PROMPT}\n\nCURRENT OBSERVATION:\n{obs_text}\n\nMEMORY:\n{mem_text}\n\nRespond with ONLY a JSON object containing thought, action, direction. No other text.",
+                },
+            ]
 
         for attempt in range(3):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=TOOLS_SCHEMA,
-                    tool_choice="auto",
-                    temperature=0.2,
-                    max_tokens=400,
-                )
+                kwargs = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": 0.1,
+                    "max_tokens": 400,
+                }
+                # Only use function calling for models that support it
+                if "gpt-4" in self.model or "gpt-3.5" in self.model:
+                    kwargs["tools"] = TOOLS_SCHEMA
+                    kwargs["tool_choice"] = "auto"
+                else:
+                    kwargs["response_format"] = {"type": "json_object"}
+
+                response = self.client.chat.completions.create(**kwargs)
                 msg = response.choices[0].message
 
-                # Tool call
-                if msg.tool_calls:
+                # Tool call (OpenAI native only)
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
                     return self._handle_tool_call(msg.tool_calls[0])
 
                 # Plain text response
@@ -177,6 +200,32 @@ class LLMAgent:
         direction = parsed.get("direction")
         if direction:
             direction = str(direction).upper() if str(direction).upper() in ("N", "E", "S", "W") else str(direction).lower()
+
+        # Handle plan_route action internally
+        if action == "plan_route" and "target" in parsed:
+            from planner import plan_route
+            pos = self.memory.visited_path[-1] if self.memory.visited_path else (0, 0)
+            result = plan_route(
+                {"x": pos[0], "y": pos[1]},
+                parsed["target"],
+                [list(w) for w in self.memory.walls],
+            )
+            self.tool_history.append({"role": "assistant", "content": f"plan_route to {parsed['target']}"})
+            self.tool_history.append({"role": "tool", "content": json.dumps(result)})
+            if result["reachable"] and result["path"]:
+                return {
+                    "thought": f"Planned route to {parsed['target']}: {result['distance']} steps. Moving {result['path'][0]}.",
+                    "action": "move",
+                    "direction": result["path"][0],
+                    "tool_result": result,
+                }
+            else:
+                return {
+                    "thought": f"No route to {parsed['target']} with current map. Need to explore more.",
+                    "action": "look",
+                    "direction": None,
+                    "tool_result": result,
+                }
 
         return {
             "thought": str(parsed.get("thought", "")),

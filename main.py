@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from datetime import datetime
+from typing import Optional
 
 from world import GridWorld
 from agent import LLMAgent
