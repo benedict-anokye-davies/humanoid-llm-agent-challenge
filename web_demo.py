@@ -1,28 +1,31 @@
-"""Generate a self-contained HTML demo of the agent trace."""
+"""Generate a self-contained HTML demo of the agent trace.
+
+Reads trace.json and produces an interactive visualisation.
+"""
 
 import json
 import os
-from pathlib import Path
 
 
 def generate_html(trace_path: str = "trace.json", output: str = "demo.html"):
     with open(trace_path) as f:
         trace = json.load(f)
 
-    # Re-run and capture state per step
+    # Re-run and capture state per step using the real harness + mock LLM
     from world import GridWorld
-    from mock_agent import MockAgent
-    
+    from agent import LLMAgent
+    from mock_llm import MockLLMClient
+
     world = GridWorld()
-    agent = MockAgent()
-    agent._build_plan()
-    
+    mock_client = MockLLMClient()
+    agent = LLMAgent(client=mock_client)
+
     states = []
-    
+
     for i in range(trace["steps"] + 1):
         obs = world.get_local_observation()
         action = agent.act(obs)
-        
+
         state = {
             "step": i + 1,
             "agent_pos": {"x": world.agent_pos.x, "y": world.agent_pos.y},
@@ -35,34 +38,31 @@ def generate_html(trace_path: str = "trace.json", output: str = "demo.html"):
             "visible": [(p.x, p.y) for p in world.visible_cells()],
             "message": "",
         }
-        
+
         result = world.step(action["action"], action.get("direction"))
         state["message"] = result["message"]
-        
+
         # Build agent memory grid
-        mem = agent.memory if hasattr(agent, 'memory') else None
-        if mem:
-            mem_grid = []
-            for y in range(world.HEIGHT):
-                row = []
-                for x in range(world.WIDTH):
-                    p = (x, y)
-                    if p in mem.walls:
-                        row.append("wall")
-                    elif p in mem.known_objects:
-                        obj = mem.known_objects[p]
-                        row.append(obj)
-                    elif p in mem.explored:
-                        row.append("explored")
-                    else:
-                        row.append("unknown")
-                mem_grid.append(row)
-            state["memory"] = mem_grid
-        else:
-            state["memory"] = [["unknown"] * world.WIDTH for _ in range(world.HEIGHT)]
-        
+        mem = agent.memory
+        mem_grid = []
+        for y in range(world.HEIGHT):
+            row = []
+            for x in range(world.WIDTH):
+                p = (x, y)
+                if p in mem.walls:
+                    row.append("wall")
+                elif p in mem.known_objects:
+                    obj = mem.known_objects[p]
+                    row.append(obj)
+                elif p in mem.explored:
+                    row.append("explored")
+                else:
+                    row.append("unknown")
+            mem_grid.append(row)
+        state["memory"] = mem_grid
+
         states.append(state)
-    
+
     # Build static world layout
     world_layout = []
     for y in range(world.HEIGHT):
@@ -78,11 +78,10 @@ def generate_html(trace_path: str = "trace.json", output: str = "demo.html"):
             else:
                 row.append("floor")
         world_layout.append(row)
-    
+
     states_json = json.dumps(states)
     layout_json = json.dumps(world_layout)
-    
-    # Generate HTML with string formatting (avoid f-string brace hell)
+
     html_parts = []
     html_parts.append("""<!DOCTYPE html>
 <html>
@@ -112,7 +111,6 @@ h1 { color: #38bdf8; margin-bottom: 5px; }
 .fog { background: #0f172a; border: 1px dashed #334155; }
 .explored { background: #1e3a5f; }
 .unknown { background: #0f172a; border: 1px dashed #1e293b; }
-
 .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }
 button { background: #38bdf8; color: #0f172a; border: none; padding: 10px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; }
 button:hover { background: #7dd3fc; }
@@ -190,19 +188,14 @@ function render() {
     const s = states[currentFrame];
     const worldEl = document.getElementById('worldGrid');
     const memEl = document.getElementById('memoryGrid');
-    
     worldEl.innerHTML = '';
     memEl.innerHTML = '';
-    
     const visibleSet = new Set(s.visible.map(p => p[0] + ',' + p[1]));
-    
     for (let y = 0; y < 8; y++) {
         for (let x = 0; x < 8; x++) {
-            // World cell
             const wCell = document.createElement('div');
             wCell.className = 'cell';
             const isVisible = visibleSet.has(x + ',' + y);
-            
             if (s.agent_pos.x === x && s.agent_pos.y === y) {
                 wCell.className += ' agent agent-' + s.agent_dir;
             } else if (worldLayout[y][x] === 'wall') {
@@ -218,8 +211,6 @@ function render() {
                 wCell.className += isVisible ? ' floor' : ' fog';
             }
             worldEl.appendChild(wCell);
-            
-            // Memory cell
             const mCell = document.createElement('div');
             mCell.className = 'cell';
             const mem = s.memory[y][x];
@@ -240,7 +231,6 @@ function render() {
             memEl.appendChild(mCell);
         }
     }
-    
     document.getElementById('stepNum').textContent = currentFrame + 1;
     document.getElementById('pos').textContent = s.agent_pos.x + ',' + s.agent_pos.y;
     document.getElementById('facing').textContent = s.agent_dir;
@@ -252,7 +242,6 @@ function render() {
     document.getElementById('result').textContent = s.message || '—';
     document.getElementById('slider').value = currentFrame;
     document.getElementById('frameCounter').textContent = 'Step ' + (currentFrame + 1) + ' / ' + states.length;
-    
     updateLog();
 }
 
@@ -282,42 +271,34 @@ function setFrame(n) {
     currentFrame = Math.max(0, Math.min(states.length - 1, parseInt(n)));
     render();
 }
-
 function stepNext() {
     if (currentFrame < states.length - 1) setFrame(currentFrame + 1);
 }
-
 function stepPrev() {
     if (currentFrame > 0) setFrame(currentFrame - 1);
 }
-
 function togglePlay() {
     playing = !playing;
     document.getElementById('playBtn').textContent = playing ? '⏸ Pause' : '▶ Play';
     if (playing) {
         timer = setInterval(() => {
-            if (currentFrame >= states.length - 1) {
-                togglePlay();
-                return;
-            }
+            if (currentFrame >= states.length - 1) { togglePlay(); return; }
             stepNext();
         }, 600);
     } else {
         clearInterval(timer);
     }
 }
-
 render();
 </script>
 </body>
 </html>""")
-    
+
     with open(output, "w") as f:
         f.write("".join(html_parts))
-    
+
     abs_path = os.path.abspath(output)
     print(f"Demo generated: {abs_path}")
-    print(f"Open in browser: file://{abs_path}")
     return abs_path
 
 

@@ -65,11 +65,15 @@ NEVER output anything except the JSON object.
 
 
 class LLMAgent:
-    def __init__(self, model: str = "gpt-4o-mini", api_key: Optional[str] = None, base_url: Optional[str] = None):
+    def __init__(self, model: str = "gpt-4o-mini", api_key: Optional[str] = None,
+                 base_url: Optional[str] = None, client=None):
         self.model = model
         self.memory = AgentSpatialMemory()
-        self.client = None
         self.tool_history: List[Dict] = []
+
+        if client is not None:
+            self.client = client
+            return
 
         if OpenAI is None:
             raise RuntimeError("openai package not installed. Run: pip install openai")
@@ -126,7 +130,11 @@ class LLMAgent:
                 else:
                     kwargs["response_format"] = {"type": "json_object"}
 
-                response = self.client.chat.completions.create(**kwargs)
+                # Support mock client with different method signature
+                if hasattr(self.client, 'chat_completions_create'):
+                    response = self.client.chat_completions_create(**kwargs)
+                else:
+                    response = self.client.chat.completions.create(**kwargs)
                 msg = response.choices[0].message
 
                 # Tool call (OpenAI native only)
